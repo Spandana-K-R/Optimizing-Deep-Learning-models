@@ -1,0 +1,544 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.5.2
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+### Fashion MNIST classifier model
+In this notebook, I have demonstrated the usage of Quantization tools in Pytorch.  
+We shall start by defining a simple Neural Network model for classification and then we will apply three methods of Quantization and compare the accuracy, model size and inference runtime against the original model.  
+The three methods are:
+1. Dynamic Quantization
+2. Post-training Static Quantization
+3. Quantized Aware Training
+
+```{python}
+import torch
+import torchvision
+import torch.nn.functional as F
+from torch import nn, optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, random_split
+
+import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+# %matplotlib inline
+```
+
+```{python}
+batch_size   = 128
+valid_size   = 0.2
+epochs       = 5
+transform    = transforms.ToTensor()  # Convert image to Tensor
+```
+
+```{python}
+# Download the Train and Test set
+
+trainset = datasets.FashionMNIST('.', train=True, download=True, transform=transform)
+testset = datasets.FashionMNIST('.', train=False, download=True, transform=transform)
+
+print("Length of the train set", len(trainset))
+print("Length of the test set", len(testset))
+```
+
+```{python}
+# Sample image from the train set and the label
+
+img_num = 10
+print("Label:", trainset[img_num][1])
+plt.imshow(trainset[img_num][0][0,:,:],'gray');
+```
+
+```{python}
+# Split the training set indices into training and validation set indices using 80:20 ratio
+
+val_size   = int(len(trainset) * valid_size)
+train_size = int(len(trainset) * (1-valid_size))
+train_dataset, val_dataset = random_split(trainset, [train_size, val_size])
+```
+
+```{python}
+# Create dataloaders for training, validation and testing datasets
+
+trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+validloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+testloader  = DataLoader(testset, batch_size=batch_size, shuffle=True)
+```
+
+```{python}
+# Model Architecture
+
+class FMNIST(nn.Module):
+    def __init__(self):
+        super(FMNIST,self).__init__()
+        self.fc1 = nn.Linear(784, 1500, bias=False)
+        self.fc2 = nn.Linear(1500, 750, bias=False)
+        self.fc3 = nn.Linear(750, 300, bias=False)
+        self.fc4 = nn.Linear(300, 10, bias=False)
+
+    def forward(self, x):
+        x = x.view(x.shape[0], -1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)#F.log_softmax(, dim=1)
+        return x
+```
+
+```{python}
+# Create model
+
+model = FMNIST()
+model
+```
+
+```{python}
+# Defining the Loss function and the Optimization function 
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+```
+
+```{python}
+# Training and Validation
+
+def train_and_val(model, trainloader, criterion, optimizer, epochs):
+    min_val_loss = np.Inf
+    
+    for epoch in range(epochs):
+        train_loss = 0
+        valid_loss = 0
+        
+        # TRAINING
+        model.train()                                           
+        for image, label in trainloader:
+            image, label = image, label
+            # Set gradients to zero
+            optimizer.zero_grad()          
+            output = model(image)
+            # Calculate loss according to CrossEntropy
+            loss   = criterion(output, label)                   
+            # Backward propagation of loss
+            loss.backward()                                     
+            # Run Adam optimiser
+            optimizer.step()                                    
+            # Set train loss as the accumulated sum of loss times the batch size
+            train_loss += loss.item()                           
+
+        # VALIDATION
+        model.eval()                                            
+        for image, label in validloader:
+            image, label = image, label
+            output = model(image)
+            loss   = criterion(output, label)
+            valid_loss += loss.item()
+
+        train_loss = (train_loss*batch_size)/train_size
+        val_loss   = (valid_loss*batch_size)/val_size
+
+        print('Epoch [{}/{}]: \tTraining Loss: {:.5f} \tValidation Loss: {:.5f}'.format(
+          epoch+1,
+          epochs,
+          train_loss,
+          val_loss
+          ))
+        
+        # Save the model only if val loss has decreased
+        if val_loss <= min_val_loss:                            
+            print('Validation loss has decreased ({:.5f} --> {:.5f}).  Model saved!'.format(
+            min_val_loss,
+            val_loss))
+            torch.save(model.state_dict(), 'model_q.pt')
+            min_val_loss = val_loss
+            
+        print()
+```
+
+```{python}
+# Check accuracy - testing
+
+def test_accuracy(model, testloader, criterion):
+    test_loss     = 0.0
+    class_correct = list(0. for i in range(10))  # 10 classes                          
+    class_total   = list(0. for i in range(10))
+
+    model.eval()
+
+    for image, target in testloader:
+        image, target = image, target
+        output = model(image)
+        loss   = criterion(output, target)
+        test_loss += loss.item()*image.size(0)
+        # Get argmax
+        _, pred = torch.max(F.softmax(output, dim=1), 1)   
+        # Array of 1's and 0's
+        correct = np.squeeze(pred.eq(target.data.view_as(pred)))           
+        
+        for i in range(len(target)):
+            label = target.data[i]
+            # Increment if pred==target
+            class_correct[label] += correct[i].item()
+            class_total[label]   += 1
+            
+    # Percentage
+    overall_accuracy = 100. * np.sum(class_correct) / np.sum(class_total)  
+    return overall_accuracy
+```
+
+```{python}
+# Define a function that will run the training function and the test accuracy
+
+def main(model,epochs=epochs):
+    train_and_val(model,trainloader, criterion, optimizer, epochs)
+    
+    model.load_state_dict(torch.load('model_q.pt'))
+    
+    accuracy = test_accuracy(model, testloader, criterion)
+    
+    return model, accuracy
+```
+
+```{python}
+# Run training and validation here or load the saved model like in the next code block
+
+model, model_accuracy = main(model)
+print(model_accuracy)
+```
+
+```{python}
+# In case you want to load the model again
+
+# model.load_state_dict(torch.load('model_q.pt'))
+```
+
+```{python}
+# Function to print the size of the model
+
+def print_size_of_model(model):
+    torch.save(model.state_dict(), "temp.p")
+    print('Size (MB):', os.path.getsize("temp.p")/1e6)
+    os.remove('temp.p')
+
+print_size_of_model(model)
+```
+
+### Dynamic Quantization  
+Now that the original FMNIST model has been defined and trained, we can specify which layers we want to quantize. Here, we will specify nn.Linear layers for quatization but, in our model, we only have nn.Linear layers so all the layers get quantized. If the model had CNN layers then those layers would not get quantized.<br>
+We also specify that we want weights to be converted to int8 values.
+
+```{python}
+import torch.quantization
+
+dynamic_quantized_model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+```
+
+```{python}
+print_size_of_model(dynamic_quantized_model)
+print_size_of_model(model)
+```
+
+```{python}
+# Compare the performance of the dynamic quantized model against the original model
+
+dynamic_quantized_accuracy = test_accuracy(dynamic_quantized_model, testloader, criterion)
+print("Accuracy of the dynamic quantized model: {}%".format(dynamic_quantized_accuracy))
+
+original_accuracy          = test_accuracy(model, testloader, criterion)
+print("Accuracy of the original model         : {}%".format(original_accuracy))
+```
+
+### Post-training Static Quantization
+Statis quantization works by installing observers (for example: *MinMaxOberserver*, *HistogramObserver*, and others) which observe the model from input to the output and collect statistics required to later quantize the parameters. Once the model is prepared this way, we can convert the model (i.e. float32 weights become int8) using an appropriate quantization technique to get the quantized model. And, as expected the size of the model reduces. But, it is not possible to perform inference at this stage as the inputs are still the same and have not been adapted to the quantized model. So the model class needs to be defined again (there is no work around for this problem) with Quantstubs and Dequantstubs. <br>
+
+For more details, please go through "Understanding_quantization.pdf" available in this repository. I found this PDF [here](https://github.com/pytorch/pytorch/issues/18318).
+
+```{python}
+# Redefine the model architecture
+
+from torch.quantization import QConfig, MinMaxObserver, HistogramObserver, default_observer, \
+default_per_channel_weight_observer
+
+class LinearReLU(nn.Sequential):
+    def __init__(self,in_channel, out_channel):
+        super(LinearReLU,self).__init__(nn.Linear(in_channel, out_channel, bias=False), nn.ReLU())
+
+class FMNIST_quant(nn.Module):
+    def __init__(self):
+        super(FMNIST_quant,self).__init__()
+        my_qconfig    = QConfig(activation=MinMaxObserver.with_args(dtype=torch.quint8),
+                                weight=default_per_channel_weight_observer.with_args(dtype=torch.qint8))
+        
+        self.quant    = torch.quantization.QuantStub(my_qconfig)
+        self.sq1      = LinearReLU(784,1500)
+        
+        self.sq2      = LinearReLU(1500,750)
+        
+        self.sq3      = LinearReLU(750,300)
+        
+        self.fc_out   = nn.Linear(300, 10, bias=False)
+        
+        self.dequant  = torch.quantization.DeQuantStub()
+
+    def forward(self, x):
+        x = x.view(x.shape[0], -1)
+        
+        x = self.quant(x)
+        
+        x = F.relu(self.sq1(x))
+        x = F.relu(self.sq2(x))
+        x = F.relu(self.sq3(x))
+        
+        x = self.fc_out(x)
+
+        x = self.dequant(x)
+        
+        # No need for F.log_softmax() as Cross Entropy loss does that implicitly
+        return x
+    
+    def fuse_model(self):
+        for m in self.modules():
+            if type(m) == LinearReLU:
+                torch.quantization.fuse_modules(m, ['0', '1'], inplace=True)
+```
+
+```{python}
+# Function to just implement the forward pass for observer calibration
+
+def calibrate(model, criterion, data_loader, n_eval=150):
+    model.eval()
+    count = 0
+    with torch.no_grad():
+        for image, target in data_loader:
+            output = model(image)
+            loss = criterion(output, target)
+            count += 1
+            if count >= n_eval:
+                return
+```
+
+```{python}
+# Train the model with the observers in place
+
+model_quant = FMNIST_quant()
+
+# Defining the Loss function and the Optimization function 
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model_quant.parameters(), lr=0.01)
+
+model_quant, model_quant_accuracy = main(model_quant)
+print(model_quant_accuracy)
+```
+
+```{python}
+# View the model
+
+# model_quant
+```
+
+```{python}
+# model_with_stubs.load_state_dict(torch.load('model_q.pt'))
+model_quant.eval()
+
+model_quant.fuse_model()
+
+# Set the qconfig - fbgemm for x86 and qnnpack for ARM qnnpack
+model_quant.qconfig = QConfig(activation=MinMaxObserver.with_args(dtype=torch.quint8),
+                        weight=default_per_channel_weight_observer.with_args(dtype=torch.qint8))
+print(model_quant.qconfig)
+torch.backends.quantized.engine = 'fbgemm'
+
+# Insert observers, calibrate the model and collect statistics
+torch.quantization.prepare(model_quant, inplace=True)
+
+calibrate(model_quant,criterion,testloader)
+
+# Convert to the quantized version
+torch.quantization.convert(model_quant, inplace=True)
+```
+
+```{python}
+# Compare the model size
+
+print_size_of_model(model_quant)  # quantized model
+print_size_of_model(model)        # original model
+```
+
+```{python}
+# Compare the test accuracies
+
+static_quantized_accuracy = test_accuracy(model_quant, testloader, criterion)
+
+print("Accuracy of the static quantized model : {}%".format(static_quantized_accuracy))
+print("Accuracy of the original model         : {}%".format(model_quant_accuracy))
+```
+
+```{python}
+# View the quantized weights
+
+model_quant.sq1[0].weight().int_repr()
+```
+
+```{python}
+# View the stat_dict of the model
+
+# for key,val in model_quant.state_dict().items():
+#     print(key)
+#     print(val)
+#     print()
+```
+
+## Quantization Aware Training
+
+Quantization Aware Training (QAT) is another way of optimizing Deep Learning models by fake quantizing the weights and activations during training. The forward and backward process of training is modified to use quantized values while still keep them as float variables. Once the model accuracy is satisfactory, we can then convert the float variables to int8 variables and reduce the size of the model without compromising on the accuracy. This method typically yields higher accuracy in comparison to the other methods discussed earlier.  
+
+The model architecture remains the same as Static Quantization (FMNIST_quant) but qconfig has to be defined differently. I am redefining the function train_and_val as train_one_epoch and also the function main.
+
+```{python}
+# Training one epoch at a time
+
+def train_one_epoch(model, trainloader, criterion, optimizer):
+    
+    model.train() 
+    
+    for image, label in trainloader:
+        image, label = image, label
+        optimizer.zero_grad()                           
+        output = model(image)
+        loss   = criterion(output, label)               
+        loss.backward()                                 
+        optimizer.step()                          
+
+    return(loss.item())
+```
+
+```{python}
+# Define a function that will run the training function and the test accuracy
+
+def main(model,epochs=epochs):
+
+    for e in range(epochs):
+        e_loss = train_one_epoch(model,trainloader, criterion, optimizer)
+        
+        # Freeze quantizer parameters (scale and zero points)
+        if e>4:
+            model.apply(torch.quantization.disable_observer)
+        
+        quantized_model = torch.quantization.convert(model.eval(), inplace=False)
+        quantized_model.eval()
+
+        acc    = test_accuracy(quantized_model, testloader, criterion)
+        print("Epoch [{}/{}]: \tTraining loss: {:2.3f} \tTest accuracy: {:2.3f}%".format(e+1,epochs,e_loss,acc))
+    
+    return quantized_model, acc
+```
+
+```{python}
+# Create model
+
+qat_model = FMNIST_quant()
+qat_model
+
+# Defining the Loss function and the Optimization function 
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(qat_model.parameters(), lr=0.001)
+```
+
+```{python}
+# Here, we will fuse the model layers as before, specify the quantization configuration and 
+# then prepare the fake quants layers
+
+qat_model.fuse_model()
+
+qat_model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+
+# OR if you want to explicitly type in the qconfig instead of using get_default_qat_qconfig
+# from torch.quantization import FakeQuantize, default_per_channel_weight_fake_quant
+# qat_model.qconfig = QConfig(activation=FakeQuantize.with_args(observer=MovingAverageMinMaxObserver,
+#                                                               quant_min=0,
+#                                                               quant_max=255,
+#                                                               reduce_range=True),
+#                             weight=default_per_channel_weight_fake_quant)
+
+# Insert fake quantization modules into the model
+torch.quantization.prepare_qat(qat_model, inplace=True)
+
+print('After preparation for QAT, note the fake-quantization modules \n',qat_model.sq1[0])
+```
+
+```{python}
+# Perform QAT and check the accuracy of the model after quantization
+
+qat_model, qat_model_accuracy = main(qat_model,5)
+print(qat_model_accuracy)
+```
+
+```{python}
+# Check if the quantized model is smaller in size compared to the original model
+
+print_size_of_model(qat_model)    # QAT model
+print_size_of_model(model)        # original model
+```
+
+```{python}
+
+```
+
+## Inference time
+Here, we shall compare evaluate the original and the quantized model for the time they take to perform inference on a 2048 images.  
+
+Firstly, we will save the models using torchscript (serialize the model) and then we will load the models to evaluate them.
+
+```{python}
+# Saving the models
+
+script_qat_model = torch.jit.script(qat_model)
+print("Pythonic code of script qat_model:\n", script_qat_model.code)
+script_qat_model.save('qat_model.pt')
+
+script_original_model = torch.jit.script(model)
+print("Pythonic code of script model:\n",script_original_model.code)
+script_original_model.save('original_model.pt')
+```
+
+```{python}
+def run_benchmark(model_file, img_loader):
+    elapsed = 0
+    model = torch.jit.load(model_file)
+    model.eval()
+    num_batches = 16
+    
+    # Run the scripted model on a few batches of images
+    for i, (images, target) in enumerate(img_loader):
+        if i < num_batches:
+            start = time.time()
+            output = model(images)
+            end = time.time()
+            elapsed = elapsed + (end-start)
+        else:
+            break
+    num_images = images.size()[0] * num_batches
+
+    print('Elapsed time using model {} for {} images: {:0.3f} ms'.format(model_file,\
+                                                                         num_images,\
+                                                                         elapsed/num_images*1000))
+
+# Run the benchmark for both the models
+run_benchmark('qat_model.pt', testloader)
+run_benchmark('original_model.pt', testloader)
+```
+
+```{python}
+
+```
